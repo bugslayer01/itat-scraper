@@ -1,0 +1,26 @@
+[project]
+name = "capcha"
+version = "0.1.0"
+description = "ITAT appeal PDF scraper with audio-captcha solving"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "faster-whisper>=1.2.1",
+    "lxml>=6.0.3",
+    "numpy>=2.4.4",
+    "opencv-python-headless>=4.13.0.92",
+    "pillow>=12.2.0",
+    "requests>=2.33.1",
+    "textual>=8.2.3",
+]
+
+[dependency-groups]
+# Install only on servers with an NVIDIA GPU. Ships the CUDA 12 runtime
+# libraries (cuBLAS, cuDNN) inside the venv so faster-whisper can run on
+# the GPU without needing system-installed CUDA.
+#   uv sync --group gpu
+gpu = [
+    "nvidia-cublas-cu12>=12.4",
+    "nvidia-cudnn-cu12>=9.0",
+]
