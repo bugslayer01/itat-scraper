@@ -14,6 +14,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import (
     Button,
+    Checkbox,
     DataTable,
     Footer,
     Header,
@@ -56,8 +57,16 @@ class ItatTui(App):
 
     #config-panel {
         height: auto;
+        max-height: 50%;
         padding: 1 2;
         border: round $primary;
+        overflow-y: auto;
+    }
+
+    #config-panel.collapsed {
+        height: 3;
+        max-height: 3;
+        overflow: hidden;
     }
 
     #top-config {
@@ -70,7 +79,7 @@ class ItatTui(App):
     }
 
     #bench-col SelectionList {
-        height: 24;
+        height: 12;
         border: round $accent;
     }
 
@@ -97,7 +106,7 @@ class ItatTui(App):
     Label.title {
         text-style: bold;
         color: $accent;
-        margin-bottom: 1;
+        margin-bottom: 0;
     }
 
     Label.section {
@@ -118,7 +127,6 @@ class ItatTui(App):
         height: auto;
         padding: 0 1;
         border: round $success;
-        margin-top: 1;
     }
 
     #stats-panel Button {
@@ -128,7 +136,7 @@ class ItatTui(App):
 
     #split {
         height: 1fr;
-        margin-top: 1;
+        min-height: 15;
     }
 
     #table-container {
@@ -155,7 +163,9 @@ class ItatTui(App):
 
     BINDINGS = [
         ("ctrl+s", "start", "Start"),
+        ("ctrl+p", "pause_resume", "Pause/Resume"),
         ("ctrl+x", "stop", "Stop"),
+        ("ctrl+t", "toggle_config", "Config"),
         ("ctrl+q", "quit", "Quit"),
     ]
 
@@ -164,7 +174,8 @@ class ItatTui(App):
         self.runner: Optional[Runner] = None
         self._stats = {
             "downloaded": 0, "skipped": 0, "nopdf": 0,
-            "notfound": 0, "captcha": 0, "errors": 0, "total": 0,
+            "notfound": 0, "captcha": 0, "captcha_retries": 0,
+            "errors": 0, "total": 0,
         }
         self._appeals_by_category: dict[str, list[dict]] = {
             "downloaded": [], "skipped": [], "nopdf": [],
@@ -177,14 +188,14 @@ class ItatTui(App):
         yield Header(show_clock=True)
 
         with Vertical(id="config-panel"):
-            yield Label("ITAT Appeal Scraper — configuration", classes="title")
+            yield Label("ITAT Appeal Scraper — configuration  [dim](Ctrl+T to collapse)[/dim]", classes="title")
 
             with Horizontal(id="top-config"):
                 with Vertical(id="bench-col"):
                     yield Label("Benches (space to toggle)", classes="section")
                     yield SelectionList[str](
                         *[
-                            Selection(name, name, initial_state=(name == "Chandigarh"))
+                            Selection(name, name, initial_state=True)
                             for name in sorted(BENCH_CODES)
                         ],
                         id="benches",
@@ -202,7 +213,7 @@ class ItatTui(App):
                             )
                         with Vertical(classes="field"):
                             yield Label("Years (e.g. 2025 / 2020-2026 / 2020,2023)", classes="field-label")
-                            yield Input(value="2020-2026", id="years")
+                            yield Input(value="2011-2026", id="years")
                     with Horizontal(classes="row"):
                         with Vertical(classes="field"):
                             yield Label("Start appeal #", classes="field-label")
@@ -213,6 +224,9 @@ class ItatTui(App):
                         with Vertical(classes="field"):
                             yield Label("Rate limit (appeals/hr, blank = unlimited)", classes="field-label")
                             yield Input(value="", id="rate")
+                        with Vertical(classes="field"):
+                            yield Label("Parallel workers (1=sequential, max ~50)", classes="field-label")
+                            yield Input(value="50", id="max_workers")
 
                     yield Label("Tuning", classes="section")
                     with Horizontal(classes="row"):
@@ -230,7 +244,7 @@ class ItatTui(App):
                             yield Label("Whisper model", classes="field-label")
                             yield Select(
                                 WHISPER_MODEL_OPTIONS,
-                                value="tiny.en",
+                                value="large-v3-turbo",
                                 id="model",
                             )
                         with Vertical(classes="field"):
@@ -239,6 +253,12 @@ class ItatTui(App):
                                 DEVICE_OPTIONS,
                                 value="auto",
                                 id="device",
+                            )
+                        with Vertical(classes="field"):
+                            yield Checkbox(
+                                "Auto-refetch captcha on fail",
+                                value=True,
+                                id="captcha_refetch",
                             )
 
                     yield Label("Download folder", classes="section")
@@ -259,6 +279,7 @@ class ItatTui(App):
 
             with Horizontal(id="controls"):
                 yield Button("Start", id="start-btn", variant="success")
+                yield Button("Pause", id="pause-btn", variant="warning", disabled=True)
                 yield Button("Stop", id="stop-btn", variant="error", disabled=True)
 
         yield Static("Status: idle", id="status-line")
@@ -269,6 +290,7 @@ class ItatTui(App):
             yield Button("No PDF: 0", id="stat-nopdf", variant="warning")
             yield Button("Not found: 0", id="stat-notfound", variant="default")
             yield Button("Captcha fail: 0", id="stat-captcha", variant="warning")
+            yield Button("Captcha retries: 0", id="stat-captcha-retries", variant="default")
             yield Button("Errors: 0", id="stat-errors", variant="error")
             yield Button("Total: 0", id="stat-total", variant="primary")
             yield Button("Show All", id="stat-all", variant="default")
@@ -298,6 +320,13 @@ class ItatTui(App):
     def action_stop(self) -> None:
         self._stop_run()
 
+    def action_toggle_config(self) -> None:
+        panel = self.query_one("#config-panel")
+        panel.toggle_class("collapsed")
+
+    def action_pause_resume(self) -> None:
+        self._toggle_pause()
+
     _STAT_BUTTON_MAP = {
         "stat-downloaded": ("downloaded", "Downloaded"),
         "stat-skipped": ("skipped", "Skipped"),
@@ -310,6 +339,8 @@ class ItatTui(App):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "start-btn":
             self._start_run()
+        elif event.button.id == "pause-btn":
+            self._toggle_pause()
         elif event.button.id == "stop-btn":
             self._stop_run()
         elif event.button.id == "stat-total":
@@ -352,6 +383,11 @@ class ItatTui(App):
         max_miss = int(self.query_one("#max_miss", Input).value or "20")
         captcha_retries = int(self.query_one("#captcha_retries", Input).value or "5")
         pipeline_retries = int(self.query_one("#pipeline_retries", Input).value or "3")
+        captcha_refetch = self.query_one("#captcha_refetch", Checkbox).value
+        if not captcha_refetch:
+            captcha_retries = 1  # no refetch: try captcha once only
+        max_workers = int(self.query_one("#max_workers", Input).value or "1")
+        max_workers = max(1, min(max_workers, 60))  # clamp to 1-60
 
         cfg = RunConfig(
             benches=benches,
@@ -360,6 +396,7 @@ class ItatTui(App):
             start_number=start,
             max_number=end,
             rate_per_hour=rate,
+            max_workers=max_workers,
             out_dir=out_dir,
             model_size=model,
             device=device,
@@ -380,12 +417,18 @@ class ItatTui(App):
             return
 
         self.query_one("#start-btn", Button).disabled = True
+        self.query_one("#pause-btn", Button).disabled = False
+        self.query_one("#pause-btn", Button).label = "Pause"
+        self.query_one("#pause-btn", Button).variant = "warning"
         self.query_one("#stop-btn", Button).disabled = False
+        # Auto-collapse config to show results table
+        self.query_one("#config-panel").add_class("collapsed")
         self._clear_table()
         self._reset_stats()
         self._log(
             f"[cyan]Starting run[/cyan]  benches={cfg.benches}  years={cfg.years}  "
-            f"range={cfg.start_number}..{cfg.max_number}  rate={cfg.rate_per_hour or 'unlimited'}/hr"
+            f"range={cfg.start_number}..{cfg.max_number}  rate={cfg.rate_per_hour or 'unlimited'}/hr  "
+            f"workers={cfg.max_workers}"
         )
         self._log(f"[dim]root:[/dim] {cfg.out_dir}")
 
@@ -411,6 +454,22 @@ class ItatTui(App):
         )
         self._run_in_background()
 
+    def _toggle_pause(self) -> None:
+        if self.runner is None:
+            return
+        if self.runner.is_paused:
+            self.runner.resume()
+            self.query_one("#pause-btn", Button).label = "Pause"
+            self.query_one("#pause-btn", Button).variant = "warning"
+            self._status("resumed")
+            self._log("[green]Resumed[/green]")
+        else:
+            self.runner.pause()
+            self.query_one("#pause-btn", Button).label = "Resume"
+            self.query_one("#pause-btn", Button).variant = "success"
+            self._status("paused")
+            self._log("[yellow]Paused — press Resume (Ctrl+P) to continue[/yellow]")
+
     def _stop_run(self) -> None:
         if self.runner is not None:
             self.runner.stop()
@@ -430,6 +489,8 @@ class ItatTui(App):
     def _finish(self) -> None:
         self.runner = None
         self.query_one("#start-btn", Button).disabled = False
+        self.query_one("#pause-btn", Button).disabled = True
+        self.query_one("#pause-btn", Button).label = "Pause"
         self.query_one("#stop-btn", Button).disabled = True
         self._status("idle")
 
@@ -485,6 +546,19 @@ class ItatTui(App):
             self._log(
                 f"  #{payload['number']} captcha try {payload['attempt']}: "
                 f"[dim]{payload['guess']}[/dim]"
+            )
+            if payload["attempt"] > 1:
+                self._stats["captcha_retries"] += 1
+                self._refresh_stats()
+        elif kind == "captcha_refetch":
+            self._log(
+                f"  [magenta]captcha failed[/magenta] #{payload['number']} "
+                f"— refetching new captcha (attempt {payload['attempt']})"
+            )
+        elif kind == "captcha_corrupt":
+            self._log(
+                f"  [red]corrupt audio[/red] #{payload['number']} "
+                f"— server overloaded, backing off (attempt {payload['attempt']})"
             )
         elif kind == "stage":
             self._status(
@@ -584,7 +658,8 @@ class ItatTui(App):
     def _reset_stats(self) -> None:
         self._stats = {
             "downloaded": 0, "skipped": 0, "nopdf": 0,
-            "notfound": 0, "captcha": 0, "errors": 0, "total": 0,
+            "notfound": 0, "captcha": 0, "captcha_retries": 0,
+            "errors": 0, "total": 0,
         }
         # Track appeal numbers per category for drill-down
         self._appeals_by_category: dict[str, list[dict]] = {
@@ -602,8 +677,10 @@ class ItatTui(App):
             "number": r["appeal_number"],
             "bench": r["bench"],
             "year": r["year"],
+            "app_type": r.get("app_type", ""),
             "note": r.get("note", ""),
-            "parties": (r.get("parties") or "")[:80],
+            "parties": r.get("parties") or "",
+            "attempts": r.get("attempts", 0),
         }
         if tag == "OK":
             self._stats["downloaded"] += 1
@@ -631,6 +708,7 @@ class ItatTui(App):
         self.query_one("#stat-nopdf", Button).label = f"No PDF: {self._stats['nopdf']}"
         self.query_one("#stat-notfound", Button).label = f"Not found: {self._stats['notfound']}"
         self.query_one("#stat-captcha", Button).label = f"Captcha fail: {self._stats['captcha']}"
+        self.query_one("#stat-captcha-retries", Button).label = f"Captcha retries: {self._stats['captcha_retries']}"
         self.query_one("#stat-errors", Button).label = f"Errors: {self._stats['errors']}"
         self.query_one("#stat-total", Button).label = f"Total: {self._stats['total']}"
 
@@ -644,25 +722,32 @@ class ItatTui(App):
         if not entries:
             self._log(f"[dim]No {title.lower()} appeals to show.[/dim]")
             return
+        tag_map = {
+            "downloaded": "[green]OK[/green]",
+            "skipped": "[cyan]SKIP[/cyan]",
+            "nopdf": "[yellow]NO PDF[/yellow]",
+            "notfound": "[dim]MISS[/dim]",
+            "captcha": "[magenta]CAPTCHA[/magenta]",
+            "errors": "[red]ERR[/red]",
+        }
         for e in entries:
-            tag_map = {
-                "downloaded": ("[green]OK[/green]"),
-                "skipped": ("[cyan]SKIP[/cyan]"),
-                "nopdf": ("[yellow]NO PDF[/yellow]"),
-                "notfound": ("[dim]MISS[/dim]"),
-                "captcha": ("[magenta]CAPTCHA[/magenta]"),
-                "errors": ("[red]ERR[/red]"),
-            }
             table.add_row(
                 e["bench"],
                 str(e["year"]),
                 str(e["number"]),
                 tag_map.get(category, "?"),
                 e["parties"][:60],
-                "",
-                e["note"][:60],
+                str(e.get("attempts", "")),
+                e["note"],
             )
         self._log(f"[bold]Showing {len(entries)} {title.lower()} appeal(s)[/bold]")
+        # Log detail summary for the category in the log panel
+        if category in ("nopdf", "errors", "captcha"):
+            for e in entries:
+                self._log(
+                    f"  [dim]{e['bench']}[/dim] / [dim]{e['year']}[/dim] / "
+                    f"#{e['number']}  — {e['note']}"
+                )
 
     def _show_all_results(self) -> None:
         """Repopulate the results table with all appeals."""
@@ -686,8 +771,8 @@ class ItatTui(App):
                     str(e["number"]),
                     tag_map.get(category, "?"),
                     e["parties"][:60],
-                    "",
-                    e["note"][:60],
+                    str(e.get("attempts", "")),
+                    e["note"],
                 )
 
 

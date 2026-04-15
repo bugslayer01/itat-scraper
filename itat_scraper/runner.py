@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import csv
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -45,6 +47,7 @@ class RunConfig:
     device: str = "auto"  # "auto" | "cuda" | "cpu"
     compute_type: str = "auto"  # "auto" | "float16" | "int8" | "int8_float16" | ...
     out_dir: Path = field(default_factory=lambda: Path("."))
+    max_workers: int = 1  # parallel workers (1 = sequential, tested safe up to ~50)
     polite_delay_s: float = 0.8
     skip_existing: bool = True  # short-circuit appeals whose PDF is already on disk
     min_pdf_bytes: int = 1024  # anything smaller is treated as corrupt and re-fetched
@@ -101,11 +104,25 @@ class Runner:
         # Shared temp dir for captcha MP3s — one root, not per-leaf
         self.tmp_dir: Path = (config.out_dir / ".itat_tmp").resolve()
         self._stop = False
+        self._paused = threading.Event()  # clear = paused, set = running
+        self._paused.set()  # start in running state
+        self._lock = threading.Lock()  # guards shared state in parallel mode
 
     # ------------------------- public -------------------------
 
     def stop(self) -> None:
         self._stop = True
+        self._paused.set()  # unblock if paused so it can exit
+
+    def pause(self) -> None:
+        self._paused.clear()
+
+    def resume(self) -> None:
+        self._paused.set()
+
+    @property
+    def is_paused(self) -> bool:
+        return not self._paused.is_set()
 
     def run(self) -> RunSummary:
         self._ensure_tmp_dir()
@@ -165,6 +182,14 @@ class Runner:
             "year_start", bench=bench, year=year, start=start, folder=str(leaf)
         )
 
+        if self.config.max_workers > 1:
+            self._process_year_parallel(bench, bench_code, year, start, leaf)
+        else:
+            self._process_year_sequential(bench, bench_code, year, start, leaf)
+
+    def _process_year_sequential(
+        self, bench: str, bench_code: str, year: int, start: int, leaf: Path,
+    ) -> None:
         consecutive_missing = 0
         last_number_scraped = start - 1
         stopped_reason: Optional[str] = None
@@ -173,10 +198,12 @@ class Runner:
             if self._stop:
                 stopped_reason = "stop requested"
                 break
+            # Block here while paused; unblocks on resume() or stop()
+            self._paused.wait()
+            if self._stop:
+                stopped_reason = "stop requested"
+                break
 
-            # Peek at skip-existing BEFORE rate limiting and polite delay —
-            # a resumed run should blaze through already-downloaded appeals
-            # without waiting a second for each one.
             skipped_result: Optional[CaseResult] = None
             if self.config.skip_existing:
                 existing = self._existing_pdfs_for(bench, year, number, leaf)
@@ -210,7 +237,6 @@ class Runner:
             self._emit("appeal_done", result=asdict(result))
             self._write_manifest(bench, year)
 
-            # Report to central DB if configured
             if self._db and category not in ("skipped",):
                 self._db.report_appeal(result, category)
 
@@ -224,26 +250,149 @@ class Runner:
             else:
                 consecutive_missing = 0
 
-            # Skip the polite delay on short-circuited skips so resumes fly.
             if skipped_result is None:
                 time.sleep(self.config.polite_delay_s)
         else:
             stopped_reason = "reached max_number"
 
-        # Upload final manifests and CSVs to S3
         if self._s3:
             try:
                 self._s3.upload_leaf_files(leaf, bench, year)
             except Exception:
-                pass  # non-fatal
+                pass
 
         self._emit(
             "year_end",
-            bench=bench,
-            year=year,
+            bench=bench, year=year,
             reason=stopped_reason or "unknown",
             last_number=last_number_scraped,
         )
+
+    def _process_year_parallel(
+        self, bench: str, bench_code: str, year: int, start: int, leaf: Path,
+    ) -> None:
+        """Process appeals with a thread pool for parallel captcha solving."""
+        consecutive_missing = 0
+        last_number_scraped = start - 1
+        stopped_reason: Optional[str] = None
+        workers = self.config.max_workers
+
+        # Create per-worker tmp dirs to avoid MP3 filename collisions
+        for w in range(workers):
+            (self.tmp_dir / f"w{w}").mkdir(parents=True, exist_ok=True)
+        worker_id = 0
+
+        # Process in batches of max_workers
+        number = start
+        while number <= self.config.max_number and not self._stop:
+            # Block here while paused
+            self._paused.wait()
+            if self._stop:
+                break
+            batch_end = min(number + workers, self.config.max_number + 1)
+            batch_numbers = list(range(number, batch_end))
+
+            # Pre-filter skips before wasting worker threads
+            to_process = []
+            for num in batch_numbers:
+                if self._stop:
+                    break
+                if self.config.skip_existing:
+                    existing = self._existing_pdfs_for(bench, year, num, leaf)
+                    if existing:
+                        result = CaseResult(
+                            appeal_number=num, bench=bench,
+                            app_type=self.config.app_type, year=year,
+                            found=True,
+                            saved_files=[
+                                f"{p.name} ({p.stat().st_size} bytes)"
+                                for p in existing
+                            ],
+                            pdf_urls=[], attempts=0,
+                            note="skipped (existing)",
+                        )
+                        self._record_result(bench, year, result)
+                        last_number_scraped = num
+                        continue
+                to_process.append(num)
+
+            if not to_process:
+                number = batch_end
+                continue
+
+            # Submit batch to thread pool
+            futures = {}
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for num in to_process:
+                    if self._stop:
+                        break
+                    self.rate_limiter.wait()
+                    self._emit("appeal_start", bench=bench, year=year, number=num)
+                    wid = worker_id % workers
+                    worker_id += 1
+                    f = pool.submit(
+                        self._process_with_retries,
+                        bench, bench_code, year, num, leaf,
+                    )
+                    futures[f] = num
+
+                for f in as_completed(futures):
+                    num = futures[f]
+                    try:
+                        result = f.result()
+                    except Exception as e:
+                        result = CaseResult(
+                            appeal_number=num, bench=bench,
+                            app_type=self.config.app_type, year=year,
+                            found=False,
+                            attempts=self.config.pipeline_retries,
+                            note=f"worker error: {type(e).__name__}: {e}",
+                        )
+                    self.rate_limiter.record()
+                    self._record_result(bench, year, result)
+                    last_number_scraped = max(last_number_scraped, num)
+
+                    if not result.found and result.note == "no records":
+                        consecutive_missing += 1
+                        if consecutive_missing >= self.config.max_consecutive_missing:
+                            stopped_reason = (
+                                f"{consecutive_missing} consecutive 'no records'"
+                            )
+                            self._stop = True
+                            break
+                    else:
+                        consecutive_missing = 0
+
+            number = batch_end
+            if self._stop and not stopped_reason:
+                stopped_reason = "stop requested"
+
+        if not stopped_reason:
+            stopped_reason = "reached max_number"
+
+        if self._s3:
+            try:
+                self._s3.upload_leaf_files(leaf, bench, year)
+            except Exception:
+                pass
+
+        self._emit(
+            "year_end",
+            bench=bench, year=year,
+            reason=stopped_reason or "unknown",
+            last_number=last_number_scraped,
+        )
+
+    def _record_result(self, bench: str, year: int, result: CaseResult) -> None:
+        """Thread-safe: append result, update summary, emit event, write manifest."""
+        with self._lock:
+            self._leaf_results[(bench, year)].append(result)
+            category = classify_failure(result)
+            self._update_summary(result)
+            self._emit("appeal_done", result=asdict(result))
+            self._write_manifest(bench, year)
+            if self._db and category not in ("skipped",):
+                self._db.report_appeal(result, category)
 
     # ------------------------- appeal processing -------------------------
 
@@ -319,11 +468,37 @@ class Runner:
         session = new_session()
         csrf = fetch_csrftkn(session)
 
+        # In parallel mode, use per-appeal tmp dir to avoid MP3 filename
+        # collisions (captcha.py uses millisecond timestamps).
+        if self.config.max_workers > 1:
+            captcha_tmp = self.tmp_dir / f"a{number}"
+            captcha_tmp.mkdir(parents=True, exist_ok=True)
+        else:
+            captcha_tmp = self.tmp_dir
+
         captcha = None
         attempts_used = 0
+        corrupt_audio_count = 0
         for attempt in range(1, self.config.captcha_retries + 1):
             attempts_used = attempt
-            guess = solve_captcha(session, self._model, self.tmp_dir)
+
+            # Catch corrupt audio (server returns garbage MP3 when overloaded)
+            try:
+                guess = solve_captcha(session, self._model, captcha_tmp)
+            except Exception as e:
+                corrupt_audio_count += 1
+                self._emit(
+                    "captcha_corrupt",
+                    bench=bench, year=year, number=number,
+                    attempt=attempt,
+                    error=f"{type(e).__name__}: {e}",
+                )
+                # Back off a bit — server is overloaded
+                time.sleep(min(2.0 * corrupt_audio_count, 10.0))
+                session = new_session()
+                csrf = fetch_csrftkn(session)
+                continue
+
             self._emit(
                 "captcha_attempt",
                 bench=bench,
@@ -335,10 +510,18 @@ class Runner:
             if verify_captcha(session, csrf, guess):
                 captcha = guess
                 break
+            self._emit(
+                "captcha_refetch",
+                bench=bench, year=year, number=number,
+                attempt=attempt,
+            )
             session = new_session()
             csrf = fetch_csrftkn(session)
 
         if captcha is None:
+            note = f"captcha failed after {self.config.captcha_retries} retries"
+            if corrupt_audio_count:
+                note += f" ({corrupt_audio_count} corrupt audio)"
             return CaseResult(
                 appeal_number=number,
                 bench=bench,
@@ -346,7 +529,7 @@ class Runner:
                 year=year,
                 found=False,
                 attempts=attempts_used,
-                note=f"captcha failed after {self.config.captcha_retries} retries",
+                note=note,
             )
 
         self._emit("stage", bench=bench, year=year, number=number, stage="searching")
