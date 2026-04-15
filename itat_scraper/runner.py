@@ -103,15 +103,16 @@ class Runner:
         self._leaf_results: dict[tuple[str, int], list[CaseResult]] = {}
         # Shared temp dir for captcha MP3s — one root, not per-leaf
         self.tmp_dir: Path = (config.out_dir / ".itat_tmp").resolve()
-        self._stop = False
+        self._stop = threading.Event()  # thread-safe stop flag
         self._paused = threading.Event()  # clear = paused, set = running
         self._paused.set()  # start in running state
         self._lock = threading.Lock()  # guards shared state in parallel mode
+        self._manifest_dirty: set[tuple[str, int]] = set()  # deferred manifest writes
 
     # ------------------------- public -------------------------
 
     def stop(self) -> None:
-        self._stop = True
+        self._stop.set()
         self._paused.set()  # unblock if paused so it can exit
 
     def pause(self) -> None:
@@ -123,6 +124,10 @@ class Runner:
     @property
     def is_paused(self) -> bool:
         return not self._paused.is_set()
+
+    @property
+    def _stopped(self) -> bool:
+        return self._stop.is_set()
 
     def run(self) -> RunSummary:
         self._ensure_tmp_dir()
@@ -142,7 +147,7 @@ class Runner:
         try:
             is_first_pair = True
             for bench_idx, bench in enumerate(self.config.benches):
-                if self._stop:
+                if self._stopped:
                     break
                 bench_code = BENCH_CODES[bench]
                 self._emit(
@@ -152,7 +157,7 @@ class Runner:
                     total=len(self.config.benches),
                 )
                 for year in self.config.years:
-                    if self._stop:
+                    if self._stopped:
                         break
                     start = self.config.start_number if is_first_pair else 1
                     is_first_pair = False
@@ -195,12 +200,11 @@ class Runner:
         stopped_reason: Optional[str] = None
 
         for number in range(start, self.config.max_number + 1):
-            if self._stop:
+            if self._stopped:
                 stopped_reason = "stop requested"
                 break
-            # Block here while paused; unblocks on resume() or stop()
             self._paused.wait()
-            if self._stop:
+            if self._stopped:
                 stopped_reason = "stop requested"
                 break
 
@@ -255,6 +259,8 @@ class Runner:
         else:
             stopped_reason = "reached max_number"
 
+        self._flush_dirty_manifests()
+
         if self._s3:
             try:
                 self._s3.upload_leaf_files(leaf, bench, year)
@@ -277,65 +283,59 @@ class Runner:
         stopped_reason: Optional[str] = None
         workers = self.config.max_workers
 
-        # Create per-worker tmp dirs to avoid MP3 filename collisions
-        for w in range(workers):
-            (self.tmp_dir / f"w{w}").mkdir(parents=True, exist_ok=True)
-        worker_id = 0
-
-        # Process in batches of max_workers
         number = start
-        while number <= self.config.max_number and not self._stop:
-            # Block here while paused
-            self._paused.wait()
-            if self._stop:
-                break
-            batch_end = min(number + workers, self.config.max_number + 1)
-            batch_numbers = list(range(number, batch_end))
-
-            # Pre-filter skips before wasting worker threads
-            to_process = []
-            for num in batch_numbers:
-                if self._stop:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            while number <= self.config.max_number and not self._stopped:
+                self._paused.wait()
+                if self._stopped:
                     break
-                if self.config.skip_existing:
-                    existing = self._existing_pdfs_for(bench, year, num, leaf)
-                    if existing:
-                        result = CaseResult(
-                            appeal_number=num, bench=bench,
-                            app_type=self.config.app_type, year=year,
-                            found=True,
-                            saved_files=[
-                                f"{p.name} ({p.stat().st_size} bytes)"
-                                for p in existing
-                            ],
-                            pdf_urls=[], attempts=0,
-                            note="skipped (existing)",
-                        )
-                        self._record_result(bench, year, result)
-                        last_number_scraped = num
-                        continue
-                to_process.append(num)
+                batch_end = min(number + workers, self.config.max_number + 1)
+                batch_numbers = list(range(number, batch_end))
 
-            if not to_process:
-                number = batch_end
-                continue
+                # Pre-filter skips before wasting worker threads
+                to_process = []
+                for num in batch_numbers:
+                    if self._stopped:
+                        break
+                    if self.config.skip_existing:
+                        existing = self._existing_pdfs_for(bench, year, num, leaf)
+                        if existing:
+                            result = CaseResult(
+                                appeal_number=num, bench=bench,
+                                app_type=self.config.app_type, year=year,
+                                found=True,
+                                saved_files=[
+                                    f"{p.name} ({p.stat().st_size} bytes)"
+                                    for p in existing
+                                ],
+                                pdf_urls=[], attempts=0,
+                                note="skipped (existing)",
+                            )
+                            self._record_result(bench, year, result)
+                            last_number_scraped = num
+                            continue
+                    to_process.append(num)
 
-            # Submit batch to thread pool
-            futures = {}
-            with ThreadPoolExecutor(max_workers=workers) as pool:
+                if not to_process:
+                    number = batch_end
+                    continue
+
+                # Submit batch
+                futures = {}
                 for num in to_process:
-                    if self._stop:
+                    if self._stopped:
                         break
                     self.rate_limiter.wait()
                     self._emit("appeal_start", bench=bench, year=year, number=num)
-                    wid = worker_id % workers
-                    worker_id += 1
                     f = pool.submit(
                         self._process_with_retries,
                         bench, bench_code, year, num, leaf,
                     )
                     futures[f] = num
 
+                # Collect results, then process in appeal-number order
+                # so consecutive_missing counting is correct.
+                batch_results: list[tuple[int, CaseResult]] = []
                 for f in as_completed(futures):
                     num = futures[f]
                     try:
@@ -349,6 +349,9 @@ class Runner:
                             note=f"worker error: {type(e).__name__}: {e}",
                         )
                     self.rate_limiter.record()
+                    batch_results.append((num, result))
+
+                for num, result in sorted(batch_results):
                     self._record_result(bench, year, result)
                     last_number_scraped = max(last_number_scraped, num)
 
@@ -358,17 +361,19 @@ class Runner:
                             stopped_reason = (
                                 f"{consecutive_missing} consecutive 'no records'"
                             )
-                            self._stop = True
+                            self._stop.set()
                             break
                     else:
                         consecutive_missing = 0
 
-            number = batch_end
-            if self._stop and not stopped_reason:
-                stopped_reason = "stop requested"
+                number = batch_end
+                if self._stopped and not stopped_reason:
+                    stopped_reason = "stop requested"
 
         if not stopped_reason:
             stopped_reason = "reached max_number"
+
+        self._flush_dirty_manifests()
 
         if self._s3:
             try:
@@ -384,13 +389,20 @@ class Runner:
         )
 
     def _record_result(self, bench: str, year: int, result: CaseResult) -> None:
-        """Thread-safe: append result, update summary, emit event, write manifest."""
+        """Thread-safe: append result, update summary, emit event."""
         with self._lock:
             self._leaf_results[(bench, year)].append(result)
             category = classify_failure(result)
             self._update_summary(result)
             self._emit("appeal_done", result=asdict(result))
-            self._write_manifest(bench, year)
+            # Append single line to JSONL (O(1) instead of rewriting all)
+            self._append_manifest(bench, year, result)
+            # Mark CSVs as dirty — rewritten at year_end or every 50 appeals
+            self._manifest_dirty.add((bench, year))
+            count = len(self._leaf_results[(bench, year)])
+            if count % 50 == 0:
+                self._write_csvs(bench, year)
+                self._manifest_dirty.discard((bench, year))
             if self._db and category not in ("skipped",):
                 self._db.report_appeal(result, category)
 
@@ -466,6 +478,14 @@ class Runner:
         self, bench: str, bench_code: str, year: int, number: int, leaf: Path
     ) -> CaseResult:
         session = new_session()
+        try:
+            return self._process_one_inner(session, bench, bench_code, year, number, leaf)
+        finally:
+            session.close()
+
+    def _process_one_inner(
+        self, session, bench: str, bench_code: str, year: int, number: int, leaf: Path
+    ) -> CaseResult:
         csrf = fetch_csrftkn(session)
 
         # In parallel mode, use per-appeal tmp dir to avoid MP3 filename
@@ -672,16 +692,19 @@ class Runner:
         else:
             s.not_found += 1
 
-    def _write_manifest(self, bench: str, year: int) -> None:
+    def _append_manifest(self, bench: str, year: int, result: CaseResult) -> None:
+        """Append a single result to the JSONL manifest (O(1) per appeal)."""
+        leaf = self._folder_for(bench, year)
+        manifest_path = leaf / "manifest.jsonl"
+        row = asdict(result)
+        row["category"] = classify_failure(result)
+        with manifest_path.open("a") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+
+    def _write_csvs(self, bench: str, year: int) -> None:
+        """Rewrite the CSV summary files from all results."""
         leaf = self._folder_for(bench, year)
         results = self._leaf_results.get((bench, year), [])
-
-        manifest_path = leaf / "manifest.jsonl"
-        with manifest_path.open("w") as f:
-            for r in results:
-                row = asdict(r)
-                row["category"] = classify_failure(r)
-                f.write(json.dumps(row, default=str) + "\n")
 
         missing_path = leaf / "missing_pdfs.csv"
         with missing_path.open("w", newline="") as f:
@@ -700,8 +723,6 @@ class Runner:
                         r.bench_alloted or "", r.attempts, r.note,
                     ])
 
-        # failures.csv — one row per non-OK appeal, with a stable category
-        # so you can filter and retry just the recoverable kinds.
         failures_path = leaf / "failures.csv"
         with failures_path.open("w", newline="") as f:
             w = csv.writer(f)
@@ -718,20 +739,27 @@ class Runner:
                     r.attempts, r.parties or "", r.note,
                 ])
 
+    def _flush_dirty_manifests(self) -> None:
+        """Rewrite CSVs for any leaves that have pending changes."""
+        for bench, year in list(self._manifest_dirty):
+            self._write_csvs(bench, year)
+        self._manifest_dirty.clear()
+
     def _cleanup_tmp(self) -> int:
-        """Delete any captcha MP3 stragglers and the shared tmp dir."""
+        """Delete all captcha MP3s (including per-worker/per-appeal subdirs)
+        and remove the tmp directory tree."""
         removed = 0
         if self.tmp_dir.exists():
-            for f in self.tmp_dir.glob("*.mp3"):
+            # Recursively find all MP3s in subdirectories
+            for f in self.tmp_dir.glob("**/*.mp3"):
                 try:
                     f.unlink()
                     removed += 1
                 except OSError:
                     pass
-            try:
-                self.tmp_dir.rmdir()
-            except OSError:
-                pass
+            # Remove all subdirectories (a*, w*) then the root
+            import shutil
+            shutil.rmtree(self.tmp_dir, ignore_errors=True)
         return removed
 
 

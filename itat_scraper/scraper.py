@@ -171,10 +171,19 @@ def no_records(html: str) -> bool:
 def download_pdf(session: requests.Session, url: str, out_path: Path) -> int:
     r = session.get(url, stream=True, timeout=PDF_TIMEOUT)
     r.raise_for_status()
+    # Validate content type — server may return HTML error pages as 200
+    ct = r.headers.get("Content-Type", "")
+    if ct and "html" in ct.lower():
+        raise RuntimeError(f"expected PDF but got {ct}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     total = 0
     with open(out_path, "wb") as f:
         for chunk in r.iter_content(16384):
+            # Validate first chunk starts with PDF magic bytes
+            if total == 0 and chunk and not chunk[:5].startswith(b"%PDF"):
+                f.close()
+                out_path.unlink(missing_ok=True)
+                raise RuntimeError("downloaded file is not a valid PDF")
             f.write(chunk)
             total += len(chunk)
     return total
