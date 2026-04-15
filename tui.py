@@ -195,7 +195,7 @@ class ItatTui(App):
                     yield Label("Benches (space to toggle)", classes="section")
                     yield SelectionList[str](
                         *[
-                            Selection(name, name, initial_state=True)
+                            Selection(name, name, initial_state=False)
                             for name in sorted(BENCH_CODES)
                         ],
                         id="benches",
