@@ -63,13 +63,27 @@ def new_session() -> requests.Session:
 
 
 def fetch_csrftkn(session: requests.Session) -> str:
-    r = _with_backoff(lambda: session.get(FORM_URL, timeout=HTTP_TIMEOUT))
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "lxml")
-    el = soup.find(id="csrftkn1")
-    if not el or not el.get("value"):
-        raise RuntimeError("csrftkn1 not found on case-status page")
-    return el["value"]
+    """Fetch the CSRF token from the case-status page.
+
+    When the server is overloaded it may return 200 with a stripped page
+    that lacks the token. We retry with backoff in that case rather than
+    crashing immediately.
+    """
+    delay = _BACKOFF_BASE_S
+    for attempt in range(1, _BACKOFF_MAX_ATTEMPTS + 1):
+        r = _with_backoff(lambda: session.get(FORM_URL, timeout=HTTP_TIMEOUT))
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "lxml")
+        el = soup.find(id="csrftkn1")
+        if el and el.get("value"):
+            return el["value"]
+        # Server returned 200 but no CSRF — likely throttling.
+        if attempt >= _BACKOFF_MAX_ATTEMPTS:
+            break
+        jitter = delay * 0.2 * (random.random() - 0.5) * 2
+        time.sleep(min(_BACKOFF_MAX_S, delay + jitter))
+        delay = min(_BACKOFF_MAX_S, delay * 2)
+    raise RuntimeError("csrftkn1 not found on case-status page after retries")
 
 
 def submit_search(
