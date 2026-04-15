@@ -123,16 +123,16 @@ def _write_silent_wav(path: Path, seconds: float = 0.5, rate: int = 16000) -> No
         wf.writeframes(struct.pack("<" + "h" * n_frames, *([0] * n_frames)))
 
 
-def _try_load_and_warmup(size: str, device: str, compute_type: str) -> WhisperModel:
-    """Construct the model AND run a dummy transcription so any runtime
-    library errors (missing libcublas, cuDNN mismatch, etc.) surface now
-    instead of on the first real captcha."""
-    model = WhisperModel(size, device=device, compute_type=compute_type)
+def _try_load_and_warmup(
+    model_path: str, device: str, compute_type: str,
+) -> WhisperModel:
+    """Construct the model from a LOCAL path and run a dummy transcription
+    so any runtime library errors surface now instead of on the first captcha."""
+    model = WhisperModel(model_path, device=device, compute_type=compute_type)
     with tempfile.TemporaryDirectory() as tmp:
         silent = Path(tmp) / "silent.wav"
         _write_silent_wav(silent)
         segs, _ = model.transcribe(str(silent), beam_size=1, language="en", vad_filter=False)
-        # Iterate so the generator actually runs (transcribe is lazy).
         for _ in segs:
             break
     return model
@@ -149,11 +149,19 @@ def is_model_cached(size: str) -> bool:
         return False
 
 
+_MODEL_SIZES = {
+    "tiny.en": "39 MB", "tiny": "39 MB", "base.en": "74 MB", "base": "74 MB",
+    "small.en": "244 MB", "small": "244 MB", "medium.en": "769 MB", "medium": "769 MB",
+    "distil-large-v3": "756 MB", "large-v3-turbo": "809 MB",
+    "large-v3": "1.5 GB", "large-v2": "1.5 GB", "large": "1.5 GB",
+}
+
+
 def ensure_model_downloaded(
     size: str,
     on_progress: object = None,
 ) -> str:
-    """Download the model if not cached. Returns the model path.
+    """Download the model if not cached. Returns the LOCAL model path.
 
     Args:
         size: Model name (e.g. 'tiny.en', 'large-v3-turbo')
@@ -167,9 +175,10 @@ def ensure_model_downloaded(
         emit(f"model {size} found in cache")
         return download_model(size, local_files_only=True)
 
-    emit(f"downloading model {size} — this may take a few minutes…")
+    human_size = _MODEL_SIZES.get(size, "unknown size")
+    emit(f"downloading model {size} ({human_size}) — please wait…")
     path = download_model(size)
-    emit(f"model {size} downloaded")
+    emit(f"model {size} download complete")
     return path
 
 
@@ -190,15 +199,17 @@ def load_whisper_model(
     """
     emit = on_progress or (lambda msg: None)
 
-    # Ensure model is downloaded before loading (shows progress)
-    ensure_model_downloaded(size, on_progress=emit)
+    # Download first (with progress) — returns the local path.
+    # Passing the local path to WhisperModel prevents it from doing
+    # its own silent download that blocks with no feedback.
+    model_path = ensure_model_downloaded(size, on_progress=emit)
 
     actual_device, default_compute = resolve_device(device)
     ct = compute_type if compute_type and compute_type != "auto" else default_compute
 
     emit(f"loading {size} on {actual_device} ({ct})…")
     try:
-        model = _try_load_and_warmup(size, actual_device, ct)
+        model = _try_load_and_warmup(model_path, actual_device, ct)
         return model, actual_device, ""
     except Exception as e:
         if actual_device == "cuda":
@@ -210,7 +221,7 @@ def load_whisper_model(
             )
             emit("CUDA failed, falling back to CPU…")
             try:
-                model = _try_load_and_warmup(size, "cpu", "int8")
+                model = _try_load_and_warmup(model_path, "cpu", "int8")
                 return model, "cpu", warning
             except Exception as e2:
                 raise RuntimeError(
