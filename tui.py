@@ -115,10 +115,15 @@ class ItatTui(App):
     }
 
     #stats-panel {
-        height: 3;
-        padding: 0 2;
+        height: auto;
+        padding: 0 1;
         border: round $success;
         margin-top: 1;
+    }
+
+    #stats-panel Button {
+        min-width: 16;
+        margin: 0 1;
     }
 
     #split {
@@ -157,6 +162,14 @@ class ItatTui(App):
     def __init__(self) -> None:
         super().__init__()
         self.runner: Optional[Runner] = None
+        self._stats = {
+            "downloaded": 0, "skipped": 0, "nopdf": 0,
+            "notfound": 0, "captcha": 0, "errors": 0, "total": 0,
+        }
+        self._appeals_by_category: dict[str, list[dict]] = {
+            "downloaded": [], "skipped": [], "nopdf": [],
+            "notfound": [], "captcha": [], "errors": [],
+        }
 
     # ------------------------- layout -------------------------
 
@@ -198,7 +211,7 @@ class ItatTui(App):
                             yield Label("Max appeal # per year", classes="field-label")
                             yield Input(value="10000", id="end")
                         with Vertical(classes="field"):
-                            yield Label("Rate limit (appeals/min, blank = unlimited)", classes="field-label")
+                            yield Label("Rate limit (appeals/hr, blank = unlimited)", classes="field-label")
                             yield Input(value="", id="rate")
 
                     yield Label("Tuning", classes="section")
@@ -251,11 +264,14 @@ class ItatTui(App):
         yield Static("Status: idle", id="status-line")
 
         with Horizontal(id="stats-panel"):
-            yield Static("Downloaded: 0", id="stat-downloaded")
-            yield Static("No PDF: 0", id="stat-nopdf")
-            yield Static("Not found: 0", id="stat-notfound")
-            yield Static("Errors: 0", id="stat-errors")
-            yield Static("Total: 0", id="stat-total")
+            yield Button("Downloaded: 0", id="stat-downloaded", variant="success")
+            yield Button("Skipped: 0", id="stat-skipped", variant="default")
+            yield Button("No PDF: 0", id="stat-nopdf", variant="warning")
+            yield Button("Not found: 0", id="stat-notfound", variant="default")
+            yield Button("Captcha fail: 0", id="stat-captcha", variant="warning")
+            yield Button("Errors: 0", id="stat-errors", variant="error")
+            yield Button("Total: 0", id="stat-total", variant="primary")
+            yield Button("Show All", id="stat-all", variant="default")
 
         with Horizontal(id="split"):
             with Vertical(id="table-container"):
@@ -282,11 +298,27 @@ class ItatTui(App):
     def action_stop(self) -> None:
         self._stop_run()
 
+    _STAT_BUTTON_MAP = {
+        "stat-downloaded": ("downloaded", "Downloaded"),
+        "stat-skipped": ("skipped", "Skipped"),
+        "stat-nopdf": ("nopdf", "No PDF"),
+        "stat-notfound": ("notfound", "Not Found"),
+        "stat-captcha": ("captcha", "Captcha Failed"),
+        "stat-errors": ("errors", "Errors"),
+    }
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "start-btn":
             self._start_run()
         elif event.button.id == "stop-btn":
             self._stop_run()
+        elif event.button.id == "stat-total":
+            self._show_all_results()
+        elif event.button.id == "stat-all":
+            self._show_all_results()
+        elif event.button.id in self._STAT_BUTTON_MAP:
+            cat, title = self._STAT_BUTTON_MAP[event.button.id]
+            self._show_category(cat, title)
 
     def _read_config(self) -> RunConfig:
         benches = list(self.query_one("#benches", SelectionList).selected)
@@ -327,7 +359,7 @@ class ItatTui(App):
             years=years,
             start_number=start,
             max_number=end,
-            rate_per_minute=rate,
+            rate_per_hour=rate,
             out_dir=out_dir,
             model_size=model,
             device=device,
@@ -353,11 +385,30 @@ class ItatTui(App):
         self._reset_stats()
         self._log(
             f"[cyan]Starting run[/cyan]  benches={cfg.benches}  years={cfg.years}  "
-            f"range={cfg.start_number}..{cfg.max_number}  rate={cfg.rate_per_minute or 'unlimited'}/min"
+            f"range={cfg.start_number}..{cfg.max_number}  rate={cfg.rate_per_hour or 'unlimited'}/hr"
         )
         self._log(f"[dim]root:[/dim] {cfg.out_dir}")
 
-        self.runner = Runner(cfg, on_event=self._on_runner_event)
+        # Distributed mode: pick up S3 + DB if env vars are present
+        s3_uploader = None
+        db_reporter = None
+        try:
+            from itat_scraper.storage import create_uploader
+            s3_uploader = create_uploader()
+        except ImportError:
+            pass
+        try:
+            from itat_scraper.reporter import create_reporter
+            db_reporter = create_reporter()
+        except ImportError:
+            pass
+
+        self.runner = Runner(
+            cfg,
+            on_event=self._on_runner_event,
+            s3_uploader=s3_uploader,
+            db_reporter=db_reporter,
+        )
         self._run_in_background()
 
     def _stop_run(self) -> None:
@@ -424,11 +475,21 @@ class ItatTui(App):
         elif kind == "appeal_start":
             self._status(
                 f"processing {payload['bench']} / {payload['year']} / #{payload['number']}"
+                f"  — solving captcha…"
             )
         elif kind == "captcha_attempt":
+            self._status(
+                f"processing {payload['bench']} / {payload['year']} / #{payload['number']}"
+                f"  — captcha attempt {payload['attempt']}: {payload['guess']}"
+            )
             self._log(
                 f"  #{payload['number']} captcha try {payload['attempt']}: "
                 f"[dim]{payload['guess']}[/dim]"
+            )
+        elif kind == "stage":
+            self._status(
+                f"processing {payload['bench']} / {payload['year']} / #{payload['number']}"
+                f"  — {payload['stage']}"
             )
         elif kind == "retry":
             self._log(
@@ -439,20 +500,32 @@ class ItatTui(App):
             r = payload["result"]
             self._add_result_row(r)
             self._bump_stats(r)
-            if r["saved_files"]:
+            tag, color = self._classify_tag(r)
+            # Update status line with running totals
+            s = self._stats
+            self._status(
+                f"processed #{r['appeal_number']}  "
+                f"OK:{s['downloaded']} SKIP:{s['skipped']} MISS:{s['notfound']} "
+                f"NO-PDF:{s['nopdf']} CAPTCHA:{s['captcha']} ERR:{s['errors']}"
+            )
+            # Log detail for every non-skip result
+            if tag == "OK":
                 self._log(
-                    f"  [green]OK[/green] {r['bench']}/{r['year']}/#{r['appeal_number']}"
+                    f"  [green]OK[/green] #{r['appeal_number']}  "
+                    f"{(r.get('parties') or '')[:70]}"
                 )
-            elif r["found"]:
+            elif tag == "SKIP":
+                pass  # don't clutter the log with skips
+            elif tag == "NO-PDF":
                 self._log(
-                    f"  [yellow]NO-PDF[/yellow] {r['bench']}/{r['year']}/"
-                    f"#{r['appeal_number']}: {r.get('parties') or r['note']}"
+                    f"  [yellow]NO-PDF[/yellow] #{r['appeal_number']}  "
+                    f"{(r.get('parties') or '')[:50]}  — {r['note']}"
                 )
+            elif tag == "MISS":
+                pass  # consecutive misses are expected, keep log clean
             else:
-                color = "dim" if r["note"] == "no records" else "red"
                 self._log(
-                    f"  [{color}]{r['note']}[/{color}] {r['bench']}/{r['year']}/"
-                    f"#{r['appeal_number']}"
+                    f"  [red]{tag}[/red] #{r['appeal_number']}  — {r['note']}"
                 )
         elif kind == "cleanup":
             self._log(
@@ -479,14 +552,8 @@ class ItatTui(App):
         self.query_one("#results-table", DataTable).clear()
 
     def _add_result_row(self, r: dict) -> None:
-        if r["saved_files"]:
-            status = "[green]OK[/green]"
-        elif r["found"]:
-            status = "[yellow]NO PDF[/yellow]"
-        elif r["note"] == "no records":
-            status = "[dim]MISS[/dim]"
-        else:
-            status = "[red]ERR[/red]"
+        tag, color = self._classify_tag(r)
+        status = f"[{color}]{tag}[/{color}]"
         parties = (r.get("parties") or "")[:60]
         note = r["note"][:60]
         self.query_one("#results-table", DataTable).add_row(
@@ -499,30 +566,129 @@ class ItatTui(App):
             note,
         )
 
+    def _classify_tag(self, r: dict) -> tuple[str, str]:
+        """Return (tag, color) for a result dict."""
+        note = r.get("note", "")
+        if note == "skipped (existing)":
+            return "SKIP", "cyan"
+        if r["saved_files"]:
+            return "OK", "green"
+        if r["found"]:
+            return "NO-PDF", "yellow"
+        if note == "no records":
+            return "MISS", "dim"
+        if "captcha failed" in note:
+            return "CAPTCHA", "magenta"
+        return "ERR", "red"
+
     def _reset_stats(self) -> None:
-        self._stats = {"downloaded": 0, "nopdf": 0, "notfound": 0, "errors": 0, "total": 0}
+        self._stats = {
+            "downloaded": 0, "skipped": 0, "nopdf": 0,
+            "notfound": 0, "captcha": 0, "errors": 0, "total": 0,
+        }
+        # Track appeal numbers per category for drill-down
+        self._appeals_by_category: dict[str, list[dict]] = {
+            "downloaded": [], "skipped": [], "nopdf": [],
+            "notfound": [], "captcha": [], "errors": [],
+        }
         self._refresh_stats()
 
     def _bump_stats(self, r: dict) -> None:
         if not hasattr(self, "_stats"):
             self._reset_stats()
         self._stats["total"] += 1
-        if r["saved_files"]:
+        tag, _ = self._classify_tag(r)
+        entry = {
+            "number": r["appeal_number"],
+            "bench": r["bench"],
+            "year": r["year"],
+            "note": r.get("note", ""),
+            "parties": (r.get("parties") or "")[:80],
+        }
+        if tag == "OK":
             self._stats["downloaded"] += 1
-        elif r["found"]:
+            self._appeals_by_category["downloaded"].append(entry)
+        elif tag == "SKIP":
+            self._stats["skipped"] += 1
+            self._appeals_by_category["skipped"].append(entry)
+        elif tag == "NO-PDF":
             self._stats["nopdf"] += 1
-        elif r["note"].startswith(("pipeline failed", "captcha failed")):
-            self._stats["errors"] += 1
-        else:
+            self._appeals_by_category["nopdf"].append(entry)
+        elif tag == "CAPTCHA":
+            self._stats["captcha"] += 1
+            self._appeals_by_category["captcha"].append(entry)
+        elif tag == "MISS":
             self._stats["notfound"] += 1
+            self._appeals_by_category["notfound"].append(entry)
+        else:
+            self._stats["errors"] += 1
+            self._appeals_by_category["errors"].append(entry)
         self._refresh_stats()
 
     def _refresh_stats(self) -> None:
-        self.query_one("#stat-downloaded", Static).update(f"Downloaded: {self._stats['downloaded']}")
-        self.query_one("#stat-nopdf", Static).update(f"No PDF: {self._stats['nopdf']}")
-        self.query_one("#stat-notfound", Static).update(f"Not found: {self._stats['notfound']}")
-        self.query_one("#stat-errors", Static).update(f"Errors: {self._stats['errors']}")
-        self.query_one("#stat-total", Static).update(f"Total: {self._stats['total']}")
+        self.query_one("#stat-downloaded", Button).label = f"Downloaded: {self._stats['downloaded']}"
+        self.query_one("#stat-skipped", Button).label = f"Skipped: {self._stats['skipped']}"
+        self.query_one("#stat-nopdf", Button).label = f"No PDF: {self._stats['nopdf']}"
+        self.query_one("#stat-notfound", Button).label = f"Not found: {self._stats['notfound']}"
+        self.query_one("#stat-captcha", Button).label = f"Captcha fail: {self._stats['captcha']}"
+        self.query_one("#stat-errors", Button).label = f"Errors: {self._stats['errors']}"
+        self.query_one("#stat-total", Button).label = f"Total: {self._stats['total']}"
+
+    def _show_category(self, category: str, title: str) -> None:
+        """Filter the results table to show only appeals in the given category."""
+        if not hasattr(self, "_appeals_by_category"):
+            return
+        table = self.query_one("#results-table", DataTable)
+        table.clear()
+        entries = self._appeals_by_category.get(category, [])
+        if not entries:
+            self._log(f"[dim]No {title.lower()} appeals to show.[/dim]")
+            return
+        for e in entries:
+            tag_map = {
+                "downloaded": ("[green]OK[/green]"),
+                "skipped": ("[cyan]SKIP[/cyan]"),
+                "nopdf": ("[yellow]NO PDF[/yellow]"),
+                "notfound": ("[dim]MISS[/dim]"),
+                "captcha": ("[magenta]CAPTCHA[/magenta]"),
+                "errors": ("[red]ERR[/red]"),
+            }
+            table.add_row(
+                e["bench"],
+                str(e["year"]),
+                str(e["number"]),
+                tag_map.get(category, "?"),
+                e["parties"][:60],
+                "",
+                e["note"][:60],
+            )
+        self._log(f"[bold]Showing {len(entries)} {title.lower()} appeal(s)[/bold]")
+
+    def _show_all_results(self) -> None:
+        """Repopulate the results table with all appeals."""
+        if not hasattr(self, "_appeals_by_category"):
+            return
+        table = self.query_one("#results-table", DataTable)
+        table.clear()
+        tag_map = {
+            "downloaded": "[green]OK[/green]",
+            "skipped": "[cyan]SKIP[/cyan]",
+            "nopdf": "[yellow]NO PDF[/yellow]",
+            "notfound": "[dim]MISS[/dim]",
+            "captcha": "[magenta]CAPTCHA[/magenta]",
+            "errors": "[red]ERR[/red]",
+        }
+        for category in ("downloaded", "skipped", "nopdf", "notfound", "captcha", "errors"):
+            for e in self._appeals_by_category.get(category, []):
+                table.add_row(
+                    e["bench"],
+                    str(e["year"]),
+                    str(e["number"]),
+                    tag_map.get(category, "?"),
+                    e["parties"][:60],
+                    "",
+                    e["note"][:60],
+                )
 
 
 def main() -> None:

@@ -40,7 +40,7 @@ class RunConfig:
     max_consecutive_missing: int = 20
     captcha_retries: int = 5
     pipeline_retries: int = 3
-    rate_per_minute: Optional[int] = None
+    rate_per_hour: Optional[int] = None
     model_size: str = "tiny.en"
     device: str = "auto"  # "auto" | "cuda" | "cpu"
     compute_type: str = "auto"  # "auto" | "float16" | "int8" | "int8_float16" | ...
@@ -76,12 +76,20 @@ class Runner:
     directory for captcha audio are global across the whole run.
     """
 
-    def __init__(self, config: RunConfig, on_event: Optional[EventCallback] = None):
+    def __init__(
+        self,
+        config: RunConfig,
+        on_event: Optional[EventCallback] = None,
+        s3_uploader: Optional[object] = None,
+        db_reporter: Optional[object] = None,
+    ):
         config.validate()
         self.config = config
         self.on_event = on_event or (lambda kind, payload: None)
-        self.rate_limiter = RateLimiter(config.rate_per_minute)
+        self.rate_limiter = RateLimiter(config.rate_per_hour)
         self._model = None
+        self._s3 = s3_uploader        # itat_scraper.storage.S3Uploader | None
+        self._db = db_reporter         # itat_scraper.reporter.DBReporter | None
         self.summary = RunSummary(
             bench=", ".join(config.benches),
             app_type=config.app_type,
@@ -110,9 +118,10 @@ class Runner:
             start=self.config.start_number,
             end=self.config.max_number,
             out=str(Path(self.config.out_dir).resolve()),
-            rate=self.config.rate_per_minute,
+            rate=self.config.rate_per_hour,
         )
 
+        run_ok = False
         try:
             is_first_pair = True
             for bench_idx, bench in enumerate(self.config.benches):
@@ -132,9 +141,16 @@ class Runner:
                     is_first_pair = False
                     self._process_year(bench, bench_code, year, start)
                 self._emit("bench_end", bench=bench)
+            run_ok = True
         finally:
             removed = self._cleanup_tmp()
             self._emit("cleanup", removed_mp3s=removed, tmp_dir=str(self.tmp_dir))
+            # Signal the central DB that this node is finished
+            if self._db:
+                if run_ok:
+                    self._db.mark_done()
+                else:
+                    self._db.mark_error()
 
         self._emit("run_end", summary=asdict(self.summary))
         return self.summary
@@ -188,10 +204,15 @@ class Runner:
                 self.rate_limiter.record()
 
             self._leaf_results[(bench, year)].append(result)
+            category = classify_failure(result)
             self._update_summary(result)
             last_number_scraped = number
             self._emit("appeal_done", result=asdict(result))
             self._write_manifest(bench, year)
+
+            # Report to central DB if configured
+            if self._db and category not in ("skipped",):
+                self._db.report_appeal(result, category)
 
             if not result.found and result.note == "no records":
                 consecutive_missing += 1
@@ -208,6 +229,13 @@ class Runner:
                 time.sleep(self.config.polite_delay_s)
         else:
             stopped_reason = "reached max_number"
+
+        # Upload final manifests and CSVs to S3
+        if self._s3:
+            try:
+                self._s3.upload_leaf_files(leaf, bench, year)
+            except Exception:
+                pass  # non-fatal
 
         self._emit(
             "year_end",
@@ -321,6 +349,7 @@ class Runner:
                 note=f"captcha failed after {self.config.captcha_retries} retries",
             )
 
+        self._emit("stage", bench=bench, year=year, number=number, stage="searching")
         response = submit_search(
             session, csrf, captcha, bench_code, self.config.app_type, number, year
         )
@@ -349,6 +378,7 @@ class Runner:
                 note="results page has no casedetails link",
             )
 
+        self._emit("stage", bench=bench, year=year, number=number, stage="fetching case details")
         details_resp = _with_backoff(
             lambda: session.get(casedetails_links[0], timeout=HTTP_TIMEOUT)
         )
@@ -381,13 +411,25 @@ class Runner:
                 note="case found but no PDF order yet",
             )
 
+        self._emit(
+            "stage", bench=bench, year=year, number=number,
+            stage=f"downloading {len(pdf_links)} PDF(s)",
+        )
         safe_bench = bench.replace(" ", "_")
         saved: list[str] = []
+        s3_keys: list[str] = []
         for i, url in enumerate(pdf_links, 1):
             filename = f"{safe_bench}_{self.config.app_type}_{number}_{year}_order{i}.pdf"
             out_path = leaf / filename
             size = download_pdf(session, url, out_path)
             saved.append(f"{out_path.name} ({size} bytes)")
+            # Upload to S3 immediately after local save
+            if self._s3:
+                try:
+                    key = self._s3.upload_pdf(out_path, bench, year)
+                    s3_keys.append(key)
+                except Exception:
+                    pass  # local copy is safe; S3 failure is non-fatal
 
         return CaseResult(
             **base,

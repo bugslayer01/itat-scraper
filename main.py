@@ -79,7 +79,7 @@ class ProgressReporter:
                 f"[cyan]run[/cyan] benches={payload['benches']} "
                 f"years={payload['years']} "
                 f"range={payload['start']}..{payload['end']} "
-                f"rate={payload['rate'] or 'unlimited'}/min"
+                f"rate={payload['rate'] or 'unlimited'}/hr"
             )
             _console.print(f"[cyan]out[/cyan] {payload['out']}")
         elif kind == "bench_start":
@@ -186,7 +186,7 @@ def _on_event(kind: str, payload: dict) -> None:
         print(
             f"[run] benches={payload['benches']} type={payload['app_type']} "
             f"years={payload['years']} range={payload['start']}..{payload['end']} "
-            f"rate={payload['rate'] or 'unlimited'}/min",
+            f"rate={payload['rate'] or 'unlimited'}/hr",
             flush=True,
         )
         print(f"[run] out_dir: {payload['out']}", flush=True)
@@ -297,10 +297,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--rate",
-        dest="rate_per_minute",
+        dest="rate_per_hour",
         type=int,
         default=None,
-        help="global cap on appeals processed per minute (default: unlimited)",
+        help="global cap on appeals processed per hour (default: unlimited)",
     )
     p.add_argument(
         "--out",
@@ -387,7 +387,7 @@ def main(argv: list[str] | None = None) -> int:
         years=years,
         start_number=args.start_number,
         max_number=args.max_number,
-        rate_per_minute=args.rate_per_minute,
+        rate_per_hour=args.rate_per_hour,
         out_dir=out_dir,
         model_size=args.model_size,
         device=args.device,
@@ -403,7 +403,26 @@ def main(argv: list[str] | None = None) -> int:
         print(f"invalid config: {e}", file=sys.stderr)
         return 2
 
-    Runner(cfg, on_event=on_event).run()
+    # Distributed mode: S3 upload + DB status reporting.
+    # Activated automatically when ITAT_* env vars are present.
+    s3_uploader = None
+    db_reporter = None
+    try:
+        from itat_scraper.storage import create_uploader
+        s3_uploader = create_uploader()
+        if s3_uploader:
+            print("[distributed] S3 uploader active", flush=True)
+    except ImportError:
+        pass
+    try:
+        from itat_scraper.reporter import create_reporter
+        db_reporter = create_reporter()
+        if db_reporter:
+            print(f"[distributed] DB reporter active (node: {db_reporter.node_id})", flush=True)
+    except ImportError:
+        pass
+
+    Runner(cfg, on_event=on_event, s3_uploader=s3_uploader, db_reporter=db_reporter).run()
     return 0
 
 

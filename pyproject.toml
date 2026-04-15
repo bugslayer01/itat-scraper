@@ -24,3 +24,14 @@ gpu = [
     "nvidia-cublas-cu12>=12.4",
     "nvidia-cudnn-cu12>=9.0",
 ]
+
+# Distributed mode: S3 storage + PostgreSQL status reporting + dashboard.
+# Install on worker droplets and the dashboard server.
+#   uv sync --group distributed
+distributed = [
+    "boto3>=1.35",
+    "psycopg[binary]>=3.2",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "jinja2>=3.1",
+]
