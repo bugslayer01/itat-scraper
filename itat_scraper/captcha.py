@@ -139,12 +139,14 @@ def _try_load_and_warmup(
 
 
 def is_model_cached(size: str) -> bool:
-    """Check if a faster-whisper model is already downloaded."""
+    """Check if a faster-whisper model is fully downloaded (including model.bin)."""
     from faster_whisper.utils import download_model
 
     try:
-        download_model(size, local_files_only=True)
-        return True
+        path = download_model(size, local_files_only=True)
+        # The HF cache may have metadata but not the actual model weights
+        model_bin = Path(path) / "model.bin"
+        return model_bin.is_file() and model_bin.stat().st_size > 0
     except Exception:
         return False
 
