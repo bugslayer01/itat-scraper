@@ -179,18 +179,47 @@ def ensure_model_downloaded(
         emit(f"model {size} found in cache")
         return download_model(size, local_files_only=True)
 
-    # macOS + Python 3.12: HF hub's parallel download spawns subprocesses
-    # inside threads, causing "bad value(s) in fds_to_keep". Disable
-    # parallel/multiprocess transfers on macOS.
-    if sys.platform == "darwin":
-        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-        os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
-
     human_size = _MODEL_SIZES.get(size, "unknown size")
     emit(f"downloading model {size} ({human_size}) — please wait…")
-    path = download_model(size)
+
+    if sys.platform == "darwin":
+        # macOS: HF hub's default downloader spawns subprocesses from threads
+        # causing "bad value(s) in fds_to_keep". Use huggingface_hub directly
+        # with max_workers=1 to avoid subprocess/fork issues.
+        path = _download_model_single_thread(size)
+    else:
+        path = download_model(size)
+
     emit(f"model {size} download complete")
     return path
+
+
+def _download_model_single_thread(size: str) -> str:
+    """Download a faster-whisper model using single-threaded HF hub download.
+    Avoids subprocess spawning that breaks on macOS threads."""
+    import re
+    from faster_whisper.utils import _MODELS
+
+    if re.match(r".*/.*", size):
+        repo_id = size
+    else:
+        repo_id = _MODELS.get(size)
+        if repo_id is None:
+            raise ValueError(f"Invalid model size '{size}'")
+
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(
+        repo_id,
+        allow_patterns=[
+            "config.json",
+            "preprocessor_config.json",
+            "model.bin",
+            "tokenizer.json",
+            "vocabulary.*",
+        ],
+        max_workers=1,  # single thread — no subprocess spawning
+    )
 
 
 def load_whisper_model(
