@@ -16,13 +16,14 @@ dependencies = [
 ]
 
 [dependency-groups]
-# Install only on servers with an NVIDIA GPU. Ships the CUDA 12 runtime
-# libraries (cuBLAS, cuDNN) inside the venv so faster-whisper can run on
-# the GPU without needing system-installed CUDA.
+# Install only on Linux machines with an NVIDIA GPU. Ships the CUDA 12
+# runtime libraries (cuBLAS, cuDNN) inside the venv so faster-whisper can
+# run on the GPU without needing system-installed CUDA.
+# On macOS, skip this group — faster-whisper runs on CPU (int8) automatically.
 #   uv sync --group gpu
 gpu = [
-    "nvidia-cublas-cu12>=12.4",
-    "nvidia-cudnn-cu12>=9.0",
+    "nvidia-cublas-cu12>=12.4; sys_platform == 'linux'",
+    "nvidia-cudnn-cu12>=9.0; sys_platform == 'linux'",
 ]
 
 # Distributed mode: S3 storage + PostgreSQL status reporting + dashboard.

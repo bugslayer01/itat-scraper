@@ -643,6 +643,7 @@ class Runner:
                 self.config.model_size,
                 device=self.config.device,
                 compute_type=self.config.compute_type,
+                on_progress=lambda msg: self._emit("model_progress", message=msg),
             )
             if warning:
                 self._emit("model_warning", warning=warning)

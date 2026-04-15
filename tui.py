@@ -506,6 +506,9 @@ class ItatTui(App):
                 f"[blue]whisper[/blue] loading {payload['size']} on "
                 f"[bold]{payload['device']}[/bold]"
             )
+        elif kind == "model_progress":
+            self._status(payload["message"])
+            self._log(f"[blue]whisper[/blue] {payload['message']}")
         elif kind == "model_warning":
             self._log(f"[red]whisper WARNING:[/red] {payload['warning']}")
         elif kind == "model_ready":

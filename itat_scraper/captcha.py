@@ -42,15 +42,18 @@ def _preload_nvidia_wheels() -> None:
     explicitly dlopen them here so CTranslate2 can find them when it
     initialises its CUDA backend.
 
-    No-op if the wheels aren't installed (we just swallow the ImportError)
-    or if the files were already loaded by something else.
+    No-op on macOS (no CUDA), or if the wheels aren't installed.
     """
-    import ctypes
     import os
     import sys
 
+    # macOS has no CUDA — skip entirely
+    if sys.platform == "darwin":
+        return
+
+    import ctypes
+
     candidates = []
-    # `nvidia` is a namespace package installed by each cuXX wheel.
     try:
         import nvidia  # type: ignore
     except ImportError:
@@ -61,7 +64,6 @@ def _preload_nvidia_wheels() -> None:
             lib_dir = os.path.join(ns_path, subdir)
             if os.path.isdir(lib_dir):
                 candidates.append(lib_dir)
-                # Also make subsequent implicit lookups work.
                 cur = os.environ.get("LD_LIBRARY_PATH", "")
                 if lib_dir not in cur.split(":"):
                     os.environ["LD_LIBRARY_PATH"] = (
@@ -136,10 +138,46 @@ def _try_load_and_warmup(size: str, device: str, compute_type: str) -> WhisperMo
     return model
 
 
+def is_model_cached(size: str) -> bool:
+    """Check if a faster-whisper model is already downloaded."""
+    from faster_whisper.utils import download_model
+
+    try:
+        download_model(size, local_files_only=True)
+        return True
+    except Exception:
+        return False
+
+
+def ensure_model_downloaded(
+    size: str,
+    on_progress: object = None,
+) -> str:
+    """Download the model if not cached. Returns the model path.
+
+    Args:
+        size: Model name (e.g. 'tiny.en', 'large-v3-turbo')
+        on_progress: Optional callback(str) for status messages
+    """
+    from faster_whisper.utils import download_model
+
+    emit = on_progress or (lambda msg: None)
+
+    if is_model_cached(size):
+        emit(f"model {size} found in cache")
+        return download_model(size, local_files_only=True)
+
+    emit(f"downloading model {size} — this may take a few minutes…")
+    path = download_model(size)
+    emit(f"model {size} downloaded")
+    return path
+
+
 def load_whisper_model(
     size: str = "tiny.en",
     device: str = "auto",
     compute_type: str = "auto",
+    on_progress: object = None,
 ) -> tuple[WhisperModel, str, str]:
     """Load a faster-whisper model. Returns (model, actual_device, warning).
 
@@ -147,10 +185,18 @@ def load_whisper_model(
     missing CUDA libs or other runtime failures, and falls back to CPU on
     any error. The returned warning string, when non-empty, should be
     surfaced to the user.
+
+    On macOS, always uses CPU with int8 (no CUDA available).
     """
+    emit = on_progress or (lambda msg: None)
+
+    # Ensure model is downloaded before loading (shows progress)
+    ensure_model_downloaded(size, on_progress=emit)
+
     actual_device, default_compute = resolve_device(device)
     ct = compute_type if compute_type and compute_type != "auto" else default_compute
 
+    emit(f"loading {size} on {actual_device} ({ct})…")
     try:
         model = _try_load_and_warmup(size, actual_device, ct)
         return model, actual_device, ""
@@ -162,6 +208,7 @@ def load_whisper_model(
                 "(e.g. `pip install nvidia-cublas-cu12 nvidia-cudnn-cu12` or "
                 "distro packages), or pass --device cpu to silence this warning."
             )
+            emit("CUDA failed, falling back to CPU…")
             try:
                 model = _try_load_and_warmup(size, "cpu", "int8")
                 return model, "cpu", warning
