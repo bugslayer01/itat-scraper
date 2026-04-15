@@ -169,6 +169,8 @@ def ensure_model_downloaded(
         size: Model name (e.g. 'tiny.en', 'large-v3-turbo')
         on_progress: Optional callback(str) for status messages
     """
+    import os
+    import sys
     from faster_whisper.utils import download_model
 
     emit = on_progress or (lambda msg: None)
@@ -176,6 +178,13 @@ def ensure_model_downloaded(
     if is_model_cached(size):
         emit(f"model {size} found in cache")
         return download_model(size, local_files_only=True)
+
+    # macOS + Python 3.12: HF hub's parallel download spawns subprocesses
+    # inside threads, causing "bad value(s) in fds_to_keep". Disable
+    # parallel/multiprocess transfers on macOS.
+    if sys.platform == "darwin":
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+        os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
 
     human_size = _MODEL_SIZES.get(size, "unknown size")
     emit(f"downloading model {size} ({human_size}) — please wait…")
