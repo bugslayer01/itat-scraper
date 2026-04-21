@@ -361,7 +361,6 @@ class Runner:
                             stopped_reason = (
                                 f"{consecutive_missing} consecutive 'no records'"
                             )
-                            self._stop.set()
                             break
                     else:
                         consecutive_missing = 0

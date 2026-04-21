@@ -1,0 +1,19 @@
+{
+  "max_safe_workers": 1,
+  "max_safe_throughput": 170.9637760408463,
+  "resume_workers": 3,
+  "total_appeals": 30,
+  "total_ok": 9,
+  "total_blocked": 5,
+  "total_captcha_ok": 9,
+  "total_captcha_fail": 15,
+  "total_errors": 1,
+  "blocked_codes": {
+    "captcha_corrupt": 5
+  },
+  "step": 2,
+  "warp_rotations": 0,
+  "found_limit": true,
+  "blocked_at_workers": 3,
+  "saved_at": "2026-04-15 17:18:27"
+}

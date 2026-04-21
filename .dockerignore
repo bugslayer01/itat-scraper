@@ -1,0 +1,13 @@
+__pycache__
+*.pyc
+.venv
+.git
+node_modules
+frontend/node_modules
+downloads
+.probe_state.json
+.probe_tmp
+.probe_burst_tmp
+.probe_pdfs
+.itat_tmp
+*.mp3
